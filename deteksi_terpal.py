@@ -1,52 +1,93 @@
 import rclpy
 from rclpy.node import Node
-import cv2
-import numpy as np
 from sensor_msgs.msg import Image
+from std_msgs.msg import Float32, String
+import cv2 as cv
+import numpy as np
 from cv_bridge import CvBridge
-from std_msgs.msg import Bool
 
 class TerpalDetector(Node):
     def __init__(self):
         super().__init__('terpal_detector')
-
+        self.publisher_x = self.create_publisher(Float32, 'target_x', 10)
+        self.publisher_color = self.create_publisher(String, 'target_color', 10)
         self.bridge = CvBridge()
-        self.image_sub = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
-        self.detect_pub = self.create_publisher(Bool, '/terpal_detected', 10)
 
-    def image_callback(self, msg):
-        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        self.cap = cv.VideoCapture(0)
+        self.timer = self.create_timer(0.1, self.detect_terpal)
 
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower_blue = np.array([100, 150, 50])
-        upper_blue = np.array([140, 255, 255])
-        mask = cv2.inRange(hsv, lower_blue, upper_blue)
+    def detect_terpal(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            return
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        detected = False
+        height, width, _ = frame.shape
+        center_x = width // 2
+        hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
 
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(largest)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        # Rentang warna untuk biru dan merah
+        color_ranges = {
+            "Blue": [([90, 50, 50], [100, 255, 255]),
+                     ([130, 50, 50], [160, 255, 255])],
+            "Red": [([0, 100, 100], [10, 255, 255]),
+                    ([170, 150, 100], [180, 255, 255])]
+        }
 
-            center_x = x + w // 2
-            frame_center_x = frame.shape[1] // 2
-            cv2.line(frame, (center_x, 0), (center_x, frame.shape[0]), (0, 255, 255), 2)
+        detected_color = None
+        largest_contour = None
+        largest_area = 0
 
-            detected = True
-            self.get_logger().info(f"Terpal Detected at X: {center_x}")
+        for color, ranges in color_ranges.items():
+            for lower, upper in ranges:
+                lower = np.array(lower, dtype=np.uint8)
+                upper = np.array(upper, dtype=np.uint8)
+                mask = cv.inRange(hsv, lower, upper)
+                contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
 
-        self.detect_pub.publish(Bool(data=detected))
-        cv2.imshow("Terpal Detection", frame)
-        cv2.waitKey(1)
+                for contour in contours:
+                    area = cv.contourArea(contour)
+                    approx = cv.approxPolyDP(contour, 0.02 * cv.arcLength(contour, True), True)
+
+                    if len(approx) == 4 and area > 1000 and area > largest_area:
+                        largest_area = area
+                        largest_contour = approx
+                        detected_color = color
+
+        if largest_contour is not None:
+            x, y, w, h = cv.boundingRect(largest_contour)
+            box_center_x = x + w // 2
+
+            # Kirim data ke ROS2
+            msg_x = Float32()
+            msg_x.data = float(box_center_x - center_x)
+            self.publisher_x.publish(msg_x)
+
+            msg_color = String()
+            msg_color.data = detected_color
+            self.publisher_color.publish(msg_color)
+
+            if detected_color == "Blue":
+                box_color = (255, 0, 0)
+            else:
+                box_color = (0, 0, 255)
+
+            cv.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
+            cv.line(frame, (box_center_x, 0), (box_center_x, height), box_color, 2)
+            cv.putText(frame, f"Target: {detected_color}", (50, 50), cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        cv.line(frame, (center_x, 0), (center_x, height), (0, 255, 255), 2)
+        cv.imshow("Terpal Detection", frame)
+
+        if cv.waitKey(1) & 0xFF == ord('q'):
+            self.cap.release()
+            cv.destroyAllWindows()
+            rclpy.shutdown()
 
 def main(args=None):
     rclpy.init(args=args)
     node = TerpalDetector()
     rclpy.spin(node)
     node.destroy_node()
-    cv2.destroyAllWindows()
     rclpy.shutdown()
 
 if __name__ == '__main__':
